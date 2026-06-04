@@ -45,6 +45,18 @@ def sanitize(name: str) -> str:
     return name[:200] or "unnamed"
 
 
+def _normalize_markdown(text: str) -> str:
+    """Normalize Markdown for duplicate detection.
+
+    This ignores the first heading line, which may vary slightly across exports
+    for the same underlying note.
+    """
+    lines = text.splitlines()
+    if lines and lines[0].startswith("# "):
+        return "\n".join(lines[1:]).strip()
+    return text.strip()
+
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 def _load_token() -> str | None:
@@ -172,16 +184,30 @@ def _post(token: str, path: str, payload: dict | None = None) -> dict:
 
 # ── HiNotes API ───────────────────────────────────────────────────────────────
 
-def get_folders(token: str) -> list[dict]:
-    """Return all user folders, each with {id, name, noteCount}."""
-    data = _post(token, "/v1/folder/list")
+def get_folders(token: str) -> tuple[list[dict], str]:
+    """Return all user folders and potentially updated token.
+    
+    Returns (folders_list, token) where token may be refreshed if session expired.
+    """
+    current_token = token
+    data = _post(current_token, "/v1/folder/list")
+    if data.get("error") == 10000:  # session_timeout
+        print("\n⚠️   Session expired. Re-logging in…\n")
+        SESSION_FILE.unlink(missing_ok=True)
+        current_token = _browser_login()
+        data = _post(current_token, "/v1/folder/list")
+    
     if data.get("error") != 0:
         raise RuntimeError(f"folder/list error: {data}")
-    return data["data"]
+    return data["data"], current_token
 
 
 def iter_folder_notes(token: str, folder_id: str, page_size: int = 50):
-    """Yield every note metadata dict in a folder, handling pagination."""
+    """Yield every note metadata dict in a folder, handling pagination.
+    
+    Note: Token may expire during iteration. Caller should handle RuntimeError
+    with 'session_timeout' message and re-login if needed.
+    """
     page = 0
     while True:
         data = _get(token, "/v1/note/recording/list", {
@@ -191,6 +217,8 @@ def iter_folder_notes(token: str, folder_id: str, page_size: int = 50):
             "sortType": "asc",       # oldest-first so files sort naturally
             "sortField": "createtime",
         })
+        if data.get("error") == 10000:  # session_timeout
+            raise RuntimeError("session_timeout: token expired during note list fetch")
         if data.get("error") != 0:
             raise RuntimeError(f"note list error: {data}")
         page_data = data["data"]
@@ -221,6 +249,17 @@ def export_note(token: str, note_id: str, tz_offset: int) -> tuple[str, str]:
     )
     r.raise_for_status()
 
+    # Check for JSON error response (session timeout, etc.)
+    try:
+        resp_data = r.json()
+        if isinstance(resp_data, dict) and resp_data.get("error"):
+            if resp_data.get("error") == 10000:  # session_timeout
+                raise RuntimeError("session_timeout: token expired during export")
+            raise RuntimeError(f"export error: {resp_data}")
+    except ValueError:
+        # Not JSON, proceed with markdown content
+        pass
+
     # Extract filename from Content-Disposition header
     cd = r.headers.get("Content-Disposition", "")
     server_name = ""
@@ -235,19 +274,25 @@ def export_note(token: str, note_id: str, tz_offset: int) -> tuple[str, str]:
 
 # ── Manifest (skip-already-downloaded) ────────────────────────────────────────
 
-def load_manifest(out_dir: Path) -> set[str]:
+def load_manifest(out_dir: Path) -> dict:
+    """Load manifest as {note_id: filename} dict for proper file tracking."""
     p = out_dir / ".manifest.json"
     if p.exists():
         try:
-            return set(json.loads(p.read_text()))
+            data = json.loads(p.read_text())
+            # Support both old format (list of IDs) and new format (dict)
+            if isinstance(data, list):
+                return {note_id: None for note_id in data}  # Migrate old format
+            return data
         except Exception:
             pass
-    return set()
+    return {}
 
 
-def save_manifest(out_dir: Path, ids: set[str]) -> None:
+def save_manifest(out_dir: Path, manifest: dict) -> None:
+    """Save manifest as {note_id: filename} dict."""
     (out_dir / ".manifest.json").write_text(
-        json.dumps(sorted(ids), indent=2), encoding="utf-8"
+        json.dumps(manifest, indent=2), encoding="utf-8"
     )
 
 
@@ -293,13 +338,14 @@ def main() -> None:
     token = get_token()
 
     # ── Skip set ──
-    done: set[str] = set() if args.force else load_manifest(out)
+    done: dict = {} if args.force else load_manifest(out)
     if done:
         print(f"   {len(done)} note(s) already downloaded (use --force to re-download).")
 
     # ── Folders ──
     print("\n📂  Fetching folder list…")
-    all_folders = get_folders(token)
+    all_folders, token = get_folders(token)
+
 
     if not all_folders:
         print("No folders found. Your account might be empty.")
@@ -334,17 +380,43 @@ def main() -> None:
         count_label = folder.get("noteCount", "?")
         print(f"\n📁  {folder['name']}  ({count_label} notes)")
 
-        for note in iter_folder_notes(token, folder["id"]):
+        try:
+            notes_iter = iter_folder_notes(token, folder["id"])
+        except RuntimeError as e:
+            if "session_timeout" in str(e):
+                print(f"⚠️   Session expired. Re-logging in…\n")
+                SESSION_FILE.unlink(missing_ok=True)
+                token = _browser_login()
+                notes_iter = iter_folder_notes(token, folder["id"])
+            else:
+                raise
+
+        for note in notes_iter:
             note_id: str = note["id"]
             title: str = note.get("title") or f"note_{note_id}"
 
+            # Skip only if note_id is in manifest AND the file still exists on disk
             if note_id in done:
-                print(f"    ⏭  {title}")
-                n_skip += 1
-                continue
+                saved_filename = done[note_id]
+                if saved_filename and (folder_dir / saved_filename).exists():
+                    print(f"    ⏭  {title}")
+                    n_skip += 1
+                    continue
+                # File was deleted locally—remove from manifest and proceed to re-download
+                del done[note_id]
 
             try:
-                server_name, md_text = export_note(token, note_id, args.tz_offset)
+                try:
+                    server_name, md_text = export_note(token, note_id, args.tz_offset)
+                except RuntimeError as e:
+                    if "session_timeout" in str(e):
+                        print(f"\n⚠️   Session expired during download. Re-logging in…\n")
+                        SESSION_FILE.unlink(missing_ok=True)
+                        token = _browser_login()
+                        # Retry the download with new token
+                        server_name, md_text = export_note(token, note_id, args.tz_offset)
+                    else:
+                        raise
 
                 # Build filename: prefer server-provided name, fall back to title
                 if server_name:
@@ -354,15 +426,21 @@ def main() -> None:
                 fname = f"{sanitize(stem)}.md"
 
                 dest = folder_dir / fname
-                # Avoid silently overwriting a different note with the same title
-                if dest.exists() and note_id not in done:
+                if dest.exists():
+                    existing_text = dest.read_text(encoding="utf-8", errors="replace")
+                    if _normalize_markdown(existing_text) == _normalize_markdown(md_text):
+                        print(f"    ⏭  duplicate {fname}")
+                        done[note_id] = fname  # Track the actual filename
+                        save_manifest(out, done)   # persist after every note (crash-safe)
+                        n_skip += 1
+                        continue
                     dest = folder_dir / f"{sanitize(stem)}_{note_id[-6:]}.md"
 
                 dest.write_text(md_text, encoding="utf-8")
-                done.add(note_id)
+                done[note_id] = dest.name  # Track the actual filename
                 save_manifest(out, done)   # persist after every note (crash-safe)
 
-                print(f"    ✅  {fname}")
+                print(f"    ✅  {dest.name}")
                 n_dl += 1
 
             except Exception as exc:
