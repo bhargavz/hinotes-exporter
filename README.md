@@ -1,13 +1,14 @@
 # hinotes-exporter
 
-Export your notes from [hinotes.hidock.com](https://hinotes.hidock.com) to local Markdown files, preserving your folder structure.
+Export your notes from [hinotes.hidock.com](https://hinotes.hidock.com) — both the AI summary and the full transcript — to local Markdown files, preserving your folder structure.
 
 ## How it works
 
 - On first run, a browser window opens so you can log in and solve the CAPTCHA manually
 - The access token is saved to `~/.hinotes_exporter/session.json` and reused on every subsequent run
 - Notes are exported using the same Markdown export endpoint the website uses natively
-- A `.manifest.json` file tracks which notes have already been downloaded — re-runs only fetch new notes
+- Each note is exported twice: the summary (`scope=summary`) and the transcript (`scope=transcription`)
+- A `.manifest.json` file tracks the summary and transcript of each note separately — re-runs only fetch what's missing, so notes exported before transcript support get their transcripts backfilled
 
 ## Output structure
 
@@ -15,12 +16,12 @@ Export your notes from [hinotes.hidock.com](https://hinotes.hidock.com) to local
 <output-dir>/
   1on1s/
     2026-06-01 Barbara Dev.md
+    2026-06-01 Barbara Dev.transcript.md
     2026-05-29 Weekly 1on1.md
-  ESR/
-    2026-05-27 ESR Team Meeting.md
-    2026-05-28 Weekly Retrospective.md
+    2026-05-29 Weekly 1on1.transcript.md
   ETD/
     2026-04-23 ETD Technical Sync.md
+    2026-04-23 ETD Technical Sync.transcript.md
   .manifest.json
 ```
 
@@ -87,6 +88,7 @@ On all future runs the saved token is used and no browser is needed. If the toke
 
 ## Notes
 
-- Each note is saved as a `.md` file named after the note title (as provided by the server, which includes the date prefix, e.g. `2026-04-23 ETD Technical Sync.md`)
+- Each note is saved as a `.md` file named after the note title (as provided by the server, which includes the date prefix, e.g. `2026-04-23 ETD Technical Sync.md`), with its transcript next to it as `<same name>.transcript.md`
+- Notes with no transcript on the server are recorded as such in the manifest and not retried (use `--force` to retry)
 - The `.manifest.json` in your output directory is updated after every note, so an interrupted run can be safely resumed by re-running the same command
 - The script does not modify or delete any data on HiNotes — it is read-only

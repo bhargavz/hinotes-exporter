@@ -2,6 +2,8 @@
 """
 hinotes_export.py — Export notes from hinotes.hidock.com to local Markdown files.
 
+Each note is saved as '<name>.md' (summary) plus '<name>.transcript.md'.
+
 Usage:
     python hinotes_export.py --output ~/Downloads/hinotes
     python hinotes_export.py --output ~/Downloads/hinotes --folder 1on1s
@@ -228,9 +230,12 @@ def iter_folder_notes(token: str, folder_id: str, page_size: int = 50):
         page += 1
 
 
-def export_note(token: str, note_id: str, tz_offset: int) -> tuple[str, str]:
+def export_note(
+    token: str, note_id: str, tz_offset: int, scope: str = "summary"
+) -> tuple[str, str]:
     """Download a note as Markdown.
 
+    scope is "summary" or "transcription".
     Returns (server_filename, markdown_text).
     The server_filename is decoded from Content-Disposition (e.g.
     '2026-04-23 ETD Technical Sync.md').
@@ -239,7 +244,7 @@ def export_note(token: str, note_id: str, tz_offset: int) -> tuple[str, str]:
         f"{BASE}/v2/note/export",
         params={
             "note_id": note_id,
-            "scope": "summary",
+            "scope": scope,
             "language": "en",
             "tz_offset": tz_offset,
             "export_format": "markdown",
@@ -275,22 +280,39 @@ def export_note(token: str, note_id: str, tz_offset: int) -> tuple[str, str]:
 # ── Manifest (skip-already-downloaded) ────────────────────────────────────────
 
 def load_manifest(out_dir: Path) -> dict:
-    """Load manifest as {note_id: filename} dict for proper file tracking."""
+    """Load manifest as {note_id: {"summary": fname, "transcription": fname}}.
+
+    A value of "" for a kind means the server had no content for it.
+    Older formats ({note_id: fname} or a list of IDs) are migrated: their
+    filename is treated as the summary, so transcripts get backfilled.
+    """
     p = out_dir / ".manifest.json"
     if p.exists():
         try:
             data = json.loads(p.read_text())
-            # Support both old format (list of IDs) and new format (dict)
             if isinstance(data, list):
-                return {note_id: None for note_id in data}  # Migrate old format
-            return data
+                return {note_id: {} for note_id in data}
+            return {
+                note_id: (v if isinstance(v, dict) else ({"summary": v} if v else {}))
+                for note_id, v in data.items()
+            }
         except Exception:
             pass
     return {}
 
 
+def _has_body(md_text: str) -> bool:
+    """True if an export has content beyond the title / creation-time header."""
+    for i, line in enumerate(md_text.splitlines()):
+        s = line.strip()
+        if not s or s.startswith("#") or s.startswith("Creation Time:"):
+            continue
+        return True
+    return False
+
+
 def save_manifest(out_dir: Path, manifest: dict) -> None:
-    """Save manifest as {note_id: filename} dict."""
+    """Save manifest as {note_id: {kind: filename}} dict."""
     (out_dir / ".manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8"
     )
@@ -394,60 +416,74 @@ def main() -> None:
         for note in notes_iter:
             note_id: str = note["id"]
             title: str = note.get("title") or f"note_{note_id}"
+            entry: dict = done.setdefault(note_id, {})
 
-            # Skip only if note_id is in manifest AND the file still exists on disk
-            if note_id in done:
-                saved_filename = done[note_id]
-                if saved_filename and (folder_dir / saved_filename).exists():
-                    print(f"    ⏭  {title}")
+            # Summary first: its filename stem is reused for the transcript.
+            for kind, ext in (("summary", ".md"), ("transcription", ".transcript.md")):
+                label = "" if kind == "summary" else " (transcript)"
+
+                # Skip if recorded and the file still exists ("" = server had none)
+                saved = entry.get(kind)
+                if saved == "" or (saved and (folder_dir / saved).exists()):
+                    print(f"    ⏭  {title}{label}")
                     n_skip += 1
                     continue
-                # File was deleted locally—remove from manifest and proceed to re-download
-                del done[note_id]
+                entry.pop(kind, None)
 
-            try:
                 try:
-                    server_name, md_text = export_note(token, note_id, args.tz_offset)
-                except RuntimeError as e:
-                    if "session_timeout" in str(e):
-                        print(f"\n⚠️   Session expired during download. Re-logging in…\n")
-                        SESSION_FILE.unlink(missing_ok=True)
-                        token = _browser_login()
-                        # Retry the download with new token
-                        server_name, md_text = export_note(token, note_id, args.tz_offset)
-                    else:
-                        raise
+                    try:
+                        server_name, md_text = export_note(
+                            token, note_id, args.tz_offset, scope=kind
+                        )
+                    except RuntimeError as e:
+                        if "session_timeout" in str(e):
+                            print(f"\n⚠️   Session expired during download. Re-logging in…\n")
+                            SESSION_FILE.unlink(missing_ok=True)
+                            token = _browser_login()
+                            server_name, md_text = export_note(
+                                token, note_id, args.tz_offset, scope=kind
+                            )
+                        else:
+                            raise
 
-                # Build filename: prefer server-provided name, fall back to title
-                if server_name:
-                    stem = Path(server_name).stem
-                else:
-                    stem = sanitize(title)
-                fname = f"{sanitize(stem)}.md"
-
-                dest = folder_dir / fname
-                if dest.exists():
-                    existing_text = dest.read_text(encoding="utf-8", errors="replace")
-                    if _normalize_markdown(existing_text) == _normalize_markdown(md_text):
-                        print(f"    ⏭  duplicate {fname}")
-                        done[note_id] = fname  # Track the actual filename
-                        save_manifest(out, done)   # persist after every note (crash-safe)
-                        n_skip += 1
+                    if kind == "transcription" and not _has_body(md_text):
+                        print(f"    ∅  {title}{label}: none available")
+                        entry[kind] = ""
+                        save_manifest(out, done)
                         continue
-                    dest = folder_dir / f"{sanitize(stem)}_{note_id[-6:]}.md"
 
-                dest.write_text(md_text, encoding="utf-8")
-                done[note_id] = dest.name  # Track the actual filename
-                save_manifest(out, done)   # persist after every note (crash-safe)
+                    # Filename stem: the transcript matches its summary's file;
+                    # the summary prefers the server-provided name, then the title.
+                    if kind == "transcription" and entry.get("summary"):
+                        stem = entry["summary"][: -len(".md")]
+                    elif server_name:
+                        stem = sanitize(Path(server_name).stem)
+                    else:
+                        stem = sanitize(title)
 
-                print(f"    ✅  {dest.name}")
-                n_dl += 1
+                    dest = folder_dir / f"{stem}{ext}"
+                    if dest.exists():
+                        existing_text = dest.read_text(encoding="utf-8", errors="replace")
+                        if _normalize_markdown(existing_text) == _normalize_markdown(md_text):
+                            print(f"    ⏭  duplicate {dest.name}")
+                            entry[kind] = dest.name
+                            save_manifest(out, done)   # crash-safe
+                            n_skip += 1
+                            continue
+                        dest = folder_dir / f"{stem}_{note_id[-6:]}{ext}"
 
-            except Exception as exc:
-                print(f"    ❌  {title}  →  {exc}")
-                n_err += 1
+                    dest.write_text(md_text, encoding="utf-8")
+                    entry[kind] = dest.name
+                    save_manifest(out, done)   # persist after every file (crash-safe)
 
-            time.sleep(args.delay)
+                    print(f"    ✅  {dest.name}")
+                    n_dl += 1
+
+                except Exception as exc:
+                    print(f"    ❌  {title}{label}  →  {exc}")
+                    n_err += 1
+
+                time.sleep(args.delay)
 
     # ── Summary ──
     print(f"\n{'─'*50}")
