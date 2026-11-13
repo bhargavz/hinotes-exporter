@@ -10,21 +10,6 @@ Export your notes from [hinotes.hidock.com](https://hinotes.hidock.com) — both
 - Each note is exported twice: the summary (`scope=summary`) and the transcript (`scope=transcription`)
 - A `.manifest.json` file tracks the summary and transcript of each note separately — re-runs only fetch what's missing, so notes exported before transcript support get their transcripts backfilled
 
-## Output structure
-
-```
-<output-dir>/
-  1on1s/
-    2026-06-01 Barbara Dev.md
-    2026-06-01 Barbara Dev.transcript.md
-    2026-05-29 Weekly 1on1.md
-    2026-05-29 Weekly 1on1.transcript.md
-  ETD/
-    2026-04-23 ETD Technical Sync.md
-    2026-04-23 ETD Technical Sync.transcript.md
-  .manifest.json
-```
-
 ## Requirements
 
 - Python 3.10+
